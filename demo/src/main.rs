@@ -216,7 +216,7 @@ impl Application for SpecView {
     }
 
     fn title(&self) -> String {
-        "DeepFilterNet Demo".to_string()
+        "Robot Ego-Noise Denoising Demo".to_string()
     }
 
     // fn theme(&self) -> Self::Theme {
@@ -300,7 +300,7 @@ impl Application for SpecView {
 
     fn view(&self) -> Element<Message> {
         let content = column![row![
-            text("DeepFilterNet Demo").size(40).width(Length::Fill),
+            text("Robot Ego-Noise Denoising Demo").size(40).width(Length::Fill),
             button("exit").on_press(Message::Exit)
         ]
         .width(1000),];
@@ -348,16 +348,6 @@ impl Application for SpecView {
                 1000,
                 0,
                 3.,
-            ))
-            .push(slider_view(
-                "Post Filter Beta",
-                self.post_filter_beta,
-                0.,
-                1.,
-                Message::PostFilterChanged,
-                1000,
-                3,
-                0.001,
             ))
             .push(self.specs())
             .push(

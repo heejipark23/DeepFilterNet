@@ -30,7 +30,7 @@ path = "src/bin/enhance_wav.rs"
 required-features = ["bin", "tract", "wav-utils", "transforms"]
 
 [features]
-default = ["default-model", "vorbis", "flac"]
+default = ["default-model-ll", "vorbis", "flac"]
 
 transforms = ["dep:thiserror", "dep:ndarray", "dep:rubato"]
 dataset = [

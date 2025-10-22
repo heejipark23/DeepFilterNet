@@ -15,7 +15,7 @@ path = "src/capture.rs"
 
 [features]
 ui = ["iced", "image_rs"]
-default-model-ll = ["deep_filter/default-model-ll"]
+default-model = ["deep_filter/default-model"]
 thresholds = []
 
 [dependencies]
@@ -41,3 +41,5 @@ rubato = "0.15"
 ringbuf = "0.3"
 env_logger = "0.10"
 log = { version = "0.4", features = ["std"] }
+hound = "3.5"
+chrono = "0.4"
