@@ -30,7 +30,7 @@ path = "src/bin/enhance_wav.rs"
 required-features = ["bin", "tract", "wav-utils", "transforms"]
 
 [features]
-default = ["default-model-ll", "vorbis", "flac"]
+default = ["default-model", "vorbis", "flac"]
 
 transforms = ["dep:thiserror", "dep:ndarray", "dep:rubato"]
 dataset = [
@@ -84,7 +84,7 @@ nightly-features = []
 capi = ["tract", "default-model", "dep:ndarray", "logging"]
 wasm = [
   "tract",
-  "default-model-ll",
+  "default-model",
   "dep:ndarray",
   "dep:wasm-bindgen",
   "dep:getrandom",

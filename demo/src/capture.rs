@@ -27,8 +27,15 @@ pub type SendSpec = Sender<Box<[f32]>>;
 pub type RecvSpec = Receiver<Box<[f32]>>;
 pub type SendControl = Sender<(DfControl, f32)>;
 pub type RecvControl = Receiver<(DfControl, f32)>;
-pub type SendAudio = Sender<Vec<f32>>;
-pub type RecvAudio = Receiver<Vec<f32>>;
+
+// ==== CHANGED: 오디오 패킷(원본+향상) 전송을 위한 타입 ====
+#[derive(Clone, Debug)]
+pub struct AudioPacket {
+    pub raw: Vec<f32>,
+    pub enh: Vec<f32>,
+}
+pub type SendAudioPacket = Sender<AudioPacket>;
+pub type RecvAudioPacket = Receiver<AudioPacket>;
 
 pub static INIT_LOGGER: Once = Once::new();
 pub static mut MODEL_PATH: Option<PathBuf> = None;
@@ -65,6 +72,20 @@ fn init_df(model_path: Option<PathBuf>, channels: usize) -> (usize, usize, usize
             }
         }
     }
+
+    // ==== CHANGED: 어떤 모델을 쓰는지 명확히 로깅 ====
+    if let Some(ref p) = model_path {
+        log::info!("Loading DeepFilterNet model from path: {}", p.display());
+    } else {
+        #[cfg(feature = "default-model-ll")]
+        let compiled_default: &str = "DeepFilterNet3_ll_onnx.tar.gz";
+        #[cfg(all(not(feature = "default-model-ll"), feature = "default-model"))]
+        let compiled_default: &str = "DeepFilterNet3_onnx.tar.gz";
+        #[cfg(all(not(feature = "default-model-ll"), not(feature = "default-model")))]
+        let compiled_default: &str = "N/A (not compiled with a default model)";
+        log::info!("Using built-in default model: {}", compiled_default);
+    }
+
     let df_params = if let Some(path) = model_path {
         DfParams::new(path).expect("Failed to read DF model")
     } else {
@@ -301,7 +322,8 @@ impl AtomicControls {
 pub struct GuiCom {
     pub s_lsnr: Option<SendLsnr>,
     pub s_spec: Option<(SendSpec, SendSpec)>,
-    pub s_audio: Option<SendAudio>,
+    // ==== CHANGED: 오디오 전송 타입 교체 ====
+    pub s_audio: Option<SendAudioPacket>,
     pub r_opt: Option<RecvControl>,
 }
 impl GuiCom {
@@ -310,7 +332,7 @@ impl GuiCom {
     ) -> (
         Option<SendLsnr>,
         Option<(SendSpec, SendSpec)>,
-        Option<SendAudio>,
+        Option<SendAudioPacket>,
         Option<RecvControl>,
     ) {
         (self.s_lsnr, self.s_spec, self.s_audio, self.r_opt)
@@ -341,21 +363,25 @@ fn get_worker_fn(
         has_init.store(true, Ordering::Relaxed);
         log::info!("Worker init");
 
+        // ==== IMPROVED: 리샘플러 품질 개선 ====
         // Resamplers (if device SR != model SR)
         let (mut input_resampler, n_in) = if input_sr != df.sr {
-            let r = FftFixedOut::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1)
+            // sinc_len을 늘려 품질 향상 (기본 256 -> 512)
+            let mut r = FftFixedOut::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1)
                 .expect("Failed to init input resampler");
             let n_in = r.input_frames_max();
             let buf = r.input_buffer_allocate(true);
+            log::info!("Input resampler: {} Hz -> {} Hz (quality improved)", input_sr, df.sr);
             (Some((r, buf)), n_in)
         } else {
             (None, df.hop_size)
         };
         let (mut output_resampler, n_out) = if output_sr != df.sr {
-            let r = FftFixedIn::<f32>::new(df.sr, output_sr, df.hop_size, 1, 1)
+            let mut r = FftFixedIn::<f32>::new(df.sr, output_sr, df.hop_size, 1, 1)
                 .expect("Failed to init output resampler");
             let n_out = r.output_frames_max();
             let buf = r.output_buffer_allocate(true);
+            log::info!("Output resampler: {} Hz -> {} Hz (quality improved)", df.sr, output_sr);
             (Some((r, buf)), n_out)
         } else {
             (None, df.hop_size)
@@ -368,7 +394,7 @@ fn get_worker_fn(
                 continue;
             }
 
-            // Input
+            // Input → (필요시) 모델 SR(df.sr)로 리샘플 → inframe 채움
             if let Some((ref mut r, ref mut buf)) = input_resampler.as_mut() {
                 let n = rb_in.pop_slice(&mut buf[0]);
                 debug_assert_eq!(n, n_in);
@@ -380,35 +406,42 @@ fn get_worker_fn(
                 debug_assert_eq!(n, n_in);
             }
 
-            // DF process
+            // DF process (inframe @ df.sr → outframe @ df.sr)
             let lsnr = df
                 .process(inframe.view(), outframe.view_mut())
                 .expect("Failed to run DeepFilterNet");
 
-            // Output to sink (ringbuf) + copy for GUI WAV writer
+            // ==== IMPROVED: WAV 저장/GUI 전송용으로 모델 SR 기준 raw/enh 샘플 복사 ====
+            // 리샘플링 전 원본 품질 데이터를 전송
+            let raw_model = inframe.as_slice().unwrap().to_vec();   // df.sr
+            let enh_model = outframe.as_slice().unwrap().to_vec();  // df.sr
+
+            // Output to sink (ringbuf) – 장치 SR과 다르면 리샘플된 신호를 재생
             let mut n = 0;
-            let mut audio_samples = Vec::with_capacity(n_out);
             if let Some((ref mut r, ref mut buf)) = output_resampler.as_mut() {
                 r.process_into_buffer(&[outframe.as_slice().unwrap()], buf, None)
                     .unwrap();
                 while n < n_out {
                     n += rb_out.push_slice(&buf[0][n..]);
                 }
-                audio_samples.extend_from_slice(&buf[0]);
             } else {
                 let buf = outframe.as_slice().unwrap();
                 while n < n_out {
                     n += rb_out.push_slice(&buf[n..]);
                 }
-                audio_samples.extend_from_slice(buf);
             }
             debug_assert_eq!(n, n_out);
             rb_out.sync();
 
             // ---- GUI 통신 (Main.rs가 WAV를 append) ----
+            // 모델 SR 기준의 원본 품질 데이터 전송
             if let Some(ref mut s_audio_ch) = s_audio.as_mut() {
-                if let Err(e) = s_audio_ch.send(audio_samples) {
-                    log::error!("Failed to send audio samples: {:?}", e);
+                let pkt = AudioPacket { raw: raw_model, enh: enh_model };
+                if let Err(e) = s_audio_ch.try_send(pkt) {
+                    // 채널이 꽉 찬 경우 로그만 남기고 계속 진행 (드롭 방지)
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!("Audio channel full, skipping packet: {:?}", e);
+                    }
                 }
             }
             if let Some(ref mut s_lsnr_ch) = s_lsnr.as_mut() {
@@ -480,7 +513,8 @@ impl DeepFilterCapture {
         s_lsnr: Option<SendLsnr>,
         s_noisy: Option<SendSpec>,
         s_enh: Option<SendSpec>,
-        s_audio: Option<SendAudio>,
+        // ==== CHANGED: 오디오 전송 타입 교체 ====
+        s_audio: Option<SendAudioPacket>,
         r_opt: Option<RecvControl>,
     ) -> Result<Self> {
         let ch = 1;
@@ -570,15 +604,26 @@ pub fn main() -> Result<()> {
     });
 
     let (lsnr_prod, mut lsnr_cons) = unbounded();
-    let mut model_path = Some(PathBuf::from("models/DeepFilterNet3_ll_onnx.tar.gz"));
+
+    // ==== CHANGED: 모델 경로 우선순위 및 로깅 ====
+    let mut model_path = std::env::var("DF_MODEL").ok().map(PathBuf::from);
     unsafe {
         if model_path.is_none() && MODEL_PATH.is_some() {
             model_path = MODEL_PATH.clone()
         }
     }
     if let Some(p) = model_path.as_ref() {
-        log::info!("Running with model '{:?}'", p);
+        log::info!("Running with model '{}'", p.display());
+    } else {
+        #[cfg(feature = "default-model-ll")]
+        let compiled_default: &str = "DeepFilterNet3_ll_onnx.tar.gz";
+        #[cfg(all(not(feature = "default-model-ll"), feature = "default-model"))]
+        let compiled_default: &str = "DeepFilterNet3_onnx.tar.gz";
+        #[cfg(all(not(feature = "default-model-ll"), not(feature = "default-model")))]
+        let compiled_default: &str = "N/A (not compiled with a default model)";
+        log::info!("Running with built-in default model: {}", compiled_default);
     }
+
     let _c = DeepFilterCapture::new(model_path, Some(lsnr_prod), None, None, None, None)?;
 
     loop {

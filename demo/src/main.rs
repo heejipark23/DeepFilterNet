@@ -5,7 +5,7 @@ use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::Duration;
 
 use clap::{Parser, ValueHint};
@@ -21,6 +21,7 @@ use image_rs::{imageops, Rgba, RgbaImage};
 mod capture;
 mod cmap;
 use capture::*;
+use capture::{AudioPacket, SendAudioPacket};
 
 /// Simple program to sample from a hd5 dataset directory
 #[derive(Parser)]
@@ -54,6 +55,17 @@ pub fn main() -> iced::Result {
         5 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
     };
+
+    let cli_model = args.model.clone();
+    if let Some(p) = cli_model.as_ref() {
+        log::info!("Model specified via --model: {}", p.display());
+    } else if let Ok(env_p) = env::var("DF_MODEL") {
+        log::info!("Model specified via DF_MODEL: {}", PathBuf::from(env_p).display());
+    } else {
+        #[cfg(feature = "default-model")]
+        let compiled_default: &str = "DeepFilterNet3_onnx.tar.gz";
+    }
+
     if args.model.is_some() {
         unsafe { MODEL_PATH = args.model }
     }
@@ -88,6 +100,34 @@ enum RecordingState {
     Recording,
 }
 
+struct WavWriterThread {
+    writer: WavWriter<BufWriter<File>>,
+}
+
+impl WavWriterThread {
+    fn new(path: &str, spec: &hound::WavSpec) -> Result<Self, String> {
+        let file = File::create(path).map_err(|e| format!("Failed to create {}: {:?}", path, e))?;
+        let buf_writer = BufWriter::with_capacity(32768, file); // 큰 버퍼 사용
+        let writer = WavWriter::new(buf_writer, *spec)
+            .map_err(|e| format!("Failed to create WAV writer: {:?}", e))?;
+        log::info!("Created WAV writer: {}", path);
+        Ok(Self { writer })
+    }
+
+    fn write_samples(&mut self, samples: &[f32]) -> Result<(), String> {
+        for &sample in samples {
+            self.writer.write_sample(sample)
+                .map_err(|e| format!("Write error: {:?}", e))?;
+        }
+        Ok(())
+    }
+
+    fn finalize(self) -> Result<(), String> {
+        self.writer.finalize()
+            .map_err(|e| format!("Finalize error: {:?}", e))
+    }
+}
+
 struct SpecView {
     df_worker: Option<DeepFilterCapture>,
     lsnr: f32,
@@ -101,12 +141,19 @@ struct SpecView {
     r_lsnr: Option<RecvLsnr>,
     r_noisy: Option<RecvSpec>,
     r_enh: Option<RecvSpec>,
-    r_audio: Option<RecvAudio>,
+    r_audio: Option<crossbeam_channel::Receiver<AudioPacket>>,
     s_controls: Option<SendControl>,
     recording_state: RecordingState,
-    wav_writer: Option<Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>>,
+    writer_thread_handle: Option<thread::JoinHandle<()>>,
+    writer_thread_sender: Option<crossbeam_channel::Sender<WriterCommand>>,
     sample_rate: usize,
-    current_filename: Option<String>,
+    current_basename: Option<String>,
+}
+
+enum WriterCommand {
+    WriteRaw(Vec<f32>),
+    WriteEnh(Vec<f32>),
+    Stop,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +163,6 @@ pub enum Message {
     LsnrChanged(f32),
     NoisyChanged,
     EnhChanged,
-    AudioReceived(Vec<f32>),
     AttenLimChanged(f32),
     PostFilterChanged(f32),
     MinThreshDbChanged(f32),
@@ -145,19 +191,13 @@ impl SpecImage {
             vmax,
         }
     }
-    fn w(&self) -> usize {
-        self.n_frames as usize
-    }
-    fn h(&self) -> usize {
-        self.n_freqs as usize
-    }
+    fn w(&self) -> usize { self.n_frames as usize }
+    fn h(&self) -> usize { self.n_freqs as usize }
     fn update<I>(&mut self, specs: I, mut n_specs: usize)
     where
         I: Iterator<Item = Box<[f32]>>,
     {
-        if n_specs == 0 {
-            return;
-        }
+        if n_specs == 0 { return; }
         if n_specs >= self.n_frames as usize {
             n_specs = self.n_frames as usize - 1;
         }
@@ -193,7 +233,7 @@ impl Application for SpecView {
                 SPEC_ENH.as_ref().unwrap().lock().unwrap().image_handle(),
             )
         };
-        
+
         (
             Self {
                 df_worker: None,
@@ -211,9 +251,10 @@ impl Application for SpecView {
                 noisy_img,
                 enh_img,
                 recording_state: RecordingState::Stopped,
-                wav_writer: None,
+                writer_thread_handle: None,
+                writer_thread_sender: None,
                 sample_rate: 48000,
-                current_filename: None,
+                current_basename: None,
             },
             Command::none(),
         )
@@ -226,16 +267,14 @@ impl Application for SpecView {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::None => (),
+
             Message::Exit => {
-                // Finalize WAV file if recording
-                if let Some(writer) = self.wav_writer.take() {
-                    if let Ok(mut guard) = writer.lock() {
-                        if let Some(w) = guard.take() {
-                            if let Err(e) = w.finalize() {
-                                log::error!("Failed to finalize WAV file: {:?}", e);
-                            }
-                        }
-                    }
+                // Writer 스레드 정리
+                if let Some(sender) = self.writer_thread_sender.take() {
+                    let _ = sender.send(WriterCommand::Stop);
+                }
+                if let Some(handle) = self.writer_thread_handle.take() {
+                    let _ = handle.join();
                 }
 
                 if let Some(worker) = &mut self.df_worker {
@@ -243,15 +282,18 @@ impl Application for SpecView {
                 }
                 exit(0);
             }
+
             Message::StartRecording => {
                 if self.recording_state == RecordingState::Stopped {
-                    let (s_lsnr, r_lsnr) = unbounded();
+                    let (s_lsnr,  r_lsnr)  = unbounded();
                     let (s_noisy, r_noisy) = unbounded();
-                    let (s_enh, r_enh) = unbounded();
-                    let (s_audio, r_audio) = unbounded();
+                    let (s_enh,   r_enh)   = unbounded();
+                    let (s_audio, r_audio) = unbounded::<AudioPacket>();
                     let (s_controls, r_controls) = unbounded();
 
-                    let model_path = env::var("DF_MODEL").ok().map(PathBuf::from);
+                    let env_model = env::var("DF_MODEL").ok().map(PathBuf::from);
+                    let model_path = env_model.or_else(|| unsafe { MODEL_PATH.clone() });
+
                     let df_worker = DeepFilterCapture::new(
                         model_path,
                         Some(s_lsnr),
@@ -263,64 +305,102 @@ impl Application for SpecView {
                     .expect("Failed to initialize DeepFilterNet audio capturing");
 
                     self.sample_rate = df_worker.sr;
-                    
-                    // Create WAV writer
-                    let timestamp = chrono::Local::now().format("%Y_%m_%d_%H%M%S");
-                    let filename = format!("Record_{}.wav", timestamp);
+
                     fs::create_dir_all("record").expect("Failed to create record directory");
-                    let filepath = format!("record/{}", filename);
-                    
+                    let ts = chrono::Local::now().format("%Y_%m_%d_%H%M%S").to_string();
+                    let base = format!("record_{}", ts);
+                    self.current_basename = Some(base.clone());
+
                     let spec = hound::WavSpec {
                         channels: 1,
                         sample_rate: self.sample_rate as u32,
-                        bits_per_sample: 16,
-                        sample_format: hound::SampleFormat::Int,
+                        bits_per_sample: 32,
+                        sample_format: hound::SampleFormat::Float,
                     };
-                    
-                    if let Ok(file) = File::create(&filepath) {
-                        let writer = WavWriter::new(BufWriter::new(file), spec)
-                            .expect("Failed to create WAV writer");
-                        self.wav_writer = Some(Arc::new(Mutex::new(Some(writer))));
-                        self.current_filename = Some(filename.clone());
-                        log::info!("Started recording to {}", filepath);
-                    }
-                    
+
+                    let raw_path = format!("record/record_raw_{}.wav", ts);
+                    let enh_path = format!("record/record_enh_{}.wav", ts);
+
+                    let (writer_tx, writer_rx) = unbounded::<WriterCommand>();
+
+                    let handle = thread::spawn(move || {
+                        let mut raw_writer = match WavWriterThread::new(&raw_path, &spec) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                log::error!("{}", e);
+                                return;
+                            }
+                        };
+                        let mut enh_writer = match WavWriterThread::new(&enh_path, &spec) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                log::error!("{}", e);
+                                return;
+                            }
+                        };
+
+                        log::info!("WAV writer thread started");
+
+                        while let Ok(cmd) = writer_rx.recv() {
+                            match cmd {
+                                WriterCommand::WriteRaw(samples) => {
+                                    if let Err(e) = raw_writer.write_samples(&samples) {
+                                        log::error!("Failed to write RAW: {}", e);
+                                    }
+                                }
+                                WriterCommand::WriteEnh(samples) => {
+                                    if let Err(e) = enh_writer.write_samples(&samples) {
+                                        log::error!("Failed to write ENH: {}", e);
+                                    }
+                                }
+                                WriterCommand::Stop => break,
+                            }
+                        }
+
+                        // Finalize all files
+                        if let Err(e) = raw_writer.finalize() {
+                            log::error!("Failed to finalize RAW: {}", e);
+                        } else {
+                            log::info!("Finalized RAW");
+                        }
+                        if let Err(e) = enh_writer.finalize() {
+                            log::error!("Failed to finalize ENH: {}", e);
+                        } else {
+                            log::info!("Finalized ENH");
+                        }
+
+                        log::info!("WAV writer thread stopped");
+                    });
+
+                    self.writer_thread_handle = Some(handle);
+                    self.writer_thread_sender = Some(writer_tx);
+
+                    log::info!(
+                        "Started recording: raw/enh/noise with basename {} (sr = {}, 32-bit float)",
+                        base, self.sample_rate
+                    );
+
                     self.df_worker = Some(df_worker);
                     self.r_lsnr = Some(r_lsnr);
                     self.r_noisy = Some(r_noisy);
                     self.r_enh = Some(r_enh);
                     self.r_audio = Some(r_audio);
                     self.s_controls = Some(s_controls);
-                    
+
                     self.recording_state = RecordingState::Recording;
                 }
             }
+
             Message::PauseRecording => {
                 if self.recording_state == RecordingState::Recording {
-                    // Finalize and close WAV file
-                    // Finalize and close WAV file
-                    if let Some(arc) = self.wav_writer.take() {
-                        match arc.lock() {
-                            Ok(mut guard) => {
-                                if let Some(wav) = guard.take() {
-                                    match wav.finalize() {
-                                        Ok(_) => {
-                                            if let Some(filename) = &self.current_filename {
-                                                log::info!("Saved recording to record/{}", filename);
-                                            }
-                                        }
-                                        Err(e) => log::error!("Failed to finalize WAV file: {:?}", e),
-                                    }
-                                } else {
-                                    log::warn!("PauseRecording: WAV writer already finalized");
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("PauseRecording: failed to lock WAV writer: {:?}", e);
-                            }
-                        }
+                    // Writer 스레드 정리
+                    if let Some(sender) = self.writer_thread_sender.take() {
+                        let _ = sender.send(WriterCommand::Stop);
                     }
-                    
+                    if let Some(handle) = self.writer_thread_handle.take() {
+                        let _ = handle.join();
+                    }
+
                     if let Some(worker) = &mut self.df_worker {
                         worker.should_stop().expect("Failed to stop DF worker");
                     }
@@ -330,33 +410,27 @@ impl Application for SpecView {
                     self.r_enh = None;
                     self.r_audio = None;
                     self.s_controls = None;
-                    self.current_filename = None;
-                    
+                    self.current_basename = None;
+
                     self.recording_state = RecordingState::Stopped;
                     log::info!("Stopped recording");
                 }
             }
+
             Message::Tick => {
                 if self.recording_state != RecordingState::Recording {
                     return Command::none();
                 }
-                
                 let mut commands = Vec::new();
-                if let Some(task) = self.update_lsnr() {
-                    commands.push(Command::perform(task, move |message| message))
-                }
-                if let Some(task) = self.update_noisy() {
-                    commands.push(Command::perform(task, move |message| message))
-                }
-                if let Some(task) = self.update_enh() {
-                    commands.push(Command::perform(task, move |message| message))
-                }
-                if let Some(task) = self.update_audio() {
-                    commands.push(Command::perform(task, move |message| message))
-                }
+                if let Some(task) = self.update_lsnr() { commands.push(Command::perform(task, move |m| m)) }
+                if let Some(task) = self.update_noisy() { commands.push(Command::perform(task, move |m| m)) }
+                if let Some(task) = self.update_enh()   { commands.push(Command::perform(task, move |m| m)) }
+                if let Some(task) = self.update_audio() { commands.push(Command::perform(task, move |m| m)) }
                 return Command::batch(commands);
             }
+
             Message::LsnrChanged(lsnr) => self.lsnr = lsnr,
+
             Message::NoisyChanged => {
                 self.noisy_img = unsafe {
                     SPEC_NOISY
@@ -367,6 +441,7 @@ impl Application for SpecView {
                         .image_handle()
                 };
             }
+
             Message::EnhChanged => {
                 self.enh_img = unsafe {
                     SPEC_ENH
@@ -377,55 +452,36 @@ impl Application for SpecView {
                         .image_handle()
                 };
             }
-            Message::AudioReceived(samples) => {
-                // Write samples to WAV file in real-time
-                if let Some(writer) = &self.wav_writer {
-                    if let Ok(mut guard) = writer.lock() {
-                        if let Some(w) = guard.as_mut() {
-                            for &sample in &samples {
-                                let sample_i16 = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                                if let Err(e) = w.write_sample(sample_i16) {
-                                    log::error!("Failed to write sample: {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+
+
             Message::AttenLimChanged(v) => {
                 self.atten_lim = v;
                 if let Some(s) = &self.s_controls {
-                    s.send((DfControl::AttenLim, v))
-                        .expect("Failed to send DfControl")
+                    s.send((DfControl::AttenLim, v)).expect("Failed to send DfControl")
                 }
             }
             Message::PostFilterChanged(v) => {
                 self.post_filter_beta = v;
                 if let Some(s) = &self.s_controls {
-                    s.send((DfControl::PostFilterBeta, v))
-                        .expect("Failed to send DfControl")
+                    s.send((DfControl::PostFilterBeta, v)).expect("Failed to send DfControl")
                 }
             }
             Message::MinThreshDbChanged(v) => {
                 self.min_threshdb = v;
                 if let Some(s) = &self.s_controls {
-                    s.send((DfControl::MinThreshDb, v))
-                        .expect("Failed to send DfControl")
+                    s.send((DfControl::MinThreshDb, v)).expect("Failed to send DfControl")
                 }
             }
             Message::MaxErbThreshDbChanged(v) => {
                 self.max_erbthreshdb = v;
                 if let Some(s) = &self.s_controls {
-                    s.send((DfControl::MaxErbThreshDb, v))
-                        .expect("Failed to send DfControl")
+                    s.send((DfControl::MaxErbThreshDb, v)).expect("Failed to send DfControl")
                 }
             }
             Message::MaxDfThreshDbChanged(v) => {
                 self.max_dfthreshdb = v;
                 if let Some(s) = &self.s_controls {
-                    s.send((DfControl::MaxDfThreshDb, v))
-                        .expect("Failed to send DfControl")
+                    s.send((DfControl::MaxDfThreshDb, v)).expect("Failed to send DfControl")
                 }
             }
         }
@@ -532,57 +588,39 @@ impl Application for SpecView {
 impl SpecView {
     fn update_lsnr(&mut self) -> Option<impl Future<Output = Message>> {
         if let Some(recv) = &self.r_lsnr {
-            if recv.is_empty() {
-                return None;
-            }
+            if recv.is_empty() { return None; }
             let recv = recv.clone();
             Some(async move {
                 sleep(Duration::from_millis(100));
                 let mut lsnr = 0.;
                 let mut n = 0;
                 while let Ok(v) = recv.try_recv() {
-                    lsnr += v;
-                    n += 1;
+                    lsnr += v; n += 1;
                 }
-                if n > 0 {
-                    lsnr /= n as f32;
-                    Message::LsnrChanged(lsnr)
-                } else {
-                    Message::None
-                }
+                if n > 0 { Message::LsnrChanged(lsnr / n as f32) } else { Message::None }
             })
-        } else {
-            None
-        }
+        } else { None }
     }
 
     fn update_noisy(&mut self) -> Option<impl Future<Output = Message>> {
         if let Some(recv) = &self.r_noisy {
-            if recv.is_empty() {
-                return None;
-            }
+            if recv.is_empty() { return None; }
             let recv = recv.clone();
             Some(async move {
                 let n = recv.len();
                 unsafe {
-                    let mut spec =
-                        SPEC_NOISY.as_mut().unwrap().lock().expect("Failed to lock SPEC_NOISY");
+                    let mut spec = SPEC_NOISY.as_mut().unwrap().lock().expect("Failed to lock SPEC_NOISY");
                     spec.update(recv.iter().take(n), n);
                 }
                 Message::NoisyChanged
             })
-        } else {
-            None
-        }
+        } else { None }
     }
 
     fn update_enh(&mut self) -> Option<impl Future<Output = Message>> {
         if let Some(recv) = &self.r_enh {
-            if recv.is_empty() {
-                return None;
-            }
+            if recv.is_empty() { return None; }
             let recv = recv.clone();
-            
             Some(async move {
                 let n = recv.len();
                 unsafe {
@@ -591,38 +629,43 @@ impl SpecView {
                 }
                 Message::EnhChanged
             })
-        } else {
-            None
-        }
+        } else { None }
     }
 
     fn update_audio(&mut self) -> Option<impl Future<Output = Message>> {
         if let Some(recv) = &self.r_audio {
-            if recv.is_empty() {
-                return None;
-            }
+            if recv.is_empty() { return None; }
             let recv = recv.clone();
+            let sender = self.writer_thread_sender.clone();
             
             Some(async move {
-                let mut all_samples = Vec::new();
-                while let Ok(samples) = recv.try_recv() {
-                    all_samples.extend_from_slice(&samples);
+                // ==== FIXED: 모든 패킷을 Writer 스레드로 직접 전송 ====
+                let mut packet_count = 0;
+                while let Ok(pkt) = recv.try_recv() {
+                    if let Some(ref s) = sender {
+                        let min_len = pkt.raw.len().min(pkt.enh.len());
+                        if min_len > 0 {
+                            let raw = pkt.raw[..min_len].to_vec();
+                            let enh = pkt.enh[..min_len].to_vec();
+                            
+                            // Writer 스레드로 전송 (논블로킹)
+                            let _ = s.try_send(WriterCommand::WriteRaw(raw));
+                            let _ = s.try_send(WriterCommand::WriteEnh(enh));
+                            
+                            packet_count += 1;
+                        }
+                    }
                 }
-                if !all_samples.is_empty() {
-                    Message::AudioReceived(all_samples)
-                } else {
-                    Message::None
-                }
+                
+                Message::None // 처리만 하고 UI 업데이트 없음
             })
-        } else {
-            None
-        }
+        } else { None }
     }
 
     fn specs(&self) -> Container<Message> {
         container(column![
             spec_view("Noisy", self.noisy_img.clone(), 1000, 250),
-            spec_view("DeepFilterNet Enhanced", self.enh_img.clone(), 1000, 250),
+            spec_view("Enhanced", self.enh_img.clone(), 1000, 250),
         ])
     }
 }
