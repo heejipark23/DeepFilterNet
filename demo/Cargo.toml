@@ -15,7 +15,7 @@ path = "src/capture.rs"
 
 [features]
 ui = ["iced", "image_rs"]
-default-model = ["deep_filter/default-model"]
+default-model-ll = ["deep_filter/default-model-ll"]
 thresholds = []
 
 [dependencies]
@@ -34,7 +34,7 @@ clap = { version = "4.0", features = ["derive"] }
 deep_filter = { path = "../libDF/", default-features = false, features = [
   "tract",
   "use-jemalloc",
-  "default-model",
+  "default-model-ll",
 ] }
 ndarray = "^0.15"
 rubato = "0.15"

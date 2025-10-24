@@ -1,15 +1,15 @@
-use std::env;
-use std::fmt::Display;
-use std::io::{self, stdout, Write};
-use std::mem::MaybeUninit;
-use std::path::PathBuf;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Once,
+use std::{
+    fmt::Display,
+    io,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Once,
+    },
+    thread::{self, sleep, JoinHandle},
+    time::Duration,
 };
-use std::thread::{self, sleep, JoinHandle};
-use std::time::Duration;
-
+use std::io::Write;
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, Device, SampleRate, Stream, StreamConfig, SupportedStreamConfigRange};
@@ -19,17 +19,19 @@ use ndarray::prelude::*;
 use ringbuf::{producer::PostponedProducer, Consumer, HeapRb, SharedRb};
 use rubato::{FftFixedIn, FftFixedOut, Resampler};
 
-pub type RbProd = PostponedProducer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>;
-pub type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>;
+pub type RbProd = PostponedProducer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
+pub type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<std::mem::MaybeUninit<f32>>>>>;
 pub type SendLsnr = Sender<f32>;
 pub type RecvLsnr = Receiver<f32>;
 pub type SendSpec = Sender<Box<[f32]>>;
 pub type RecvSpec = Receiver<Box<[f32]>>;
 pub type SendControl = Sender<(DfControl, f32)>;
 pub type RecvControl = Receiver<(DfControl, f32)>;
+pub type SendAudio = Sender<Vec<f32>>;
+pub type RecvAudio = Receiver<Vec<f32>>;
 
-pub(crate) static INIT_LOGGER: Once = Once::new();
-pub(crate) static mut MODEL_PATH: Option<PathBuf> = None;
+pub static INIT_LOGGER: Once = Once::new();
+pub static mut MODEL_PATH: Option<PathBuf> = None;
 static mut MODEL: Option<DfTract> = None;
 
 const SAMPLE_FORMAT: cpal::SampleFormat = cpal::SampleFormat::F32;
@@ -45,7 +47,7 @@ pub struct AudioSource {
     device: Device,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub enum DfControl {
     AttenLim,
     PostFilterBeta,
@@ -63,7 +65,6 @@ fn init_df(model_path: Option<PathBuf>, channels: usize) -> (usize, usize, usize
             }
         }
     }
-    // let df_params = DfParams::default();
     let df_params = if let Some(path) = model_path {
         DfParams::new(path).expect("Failed to read DF model")
     } else {
@@ -121,10 +122,10 @@ fn get_stream_config(
             configs.push(*c);
         }
     }
-    // Further add multi-channel configs if no mono was found. The signal will be downmixed later.
+    // If no mono, accept multi-channel (추후 downmix)
     for c in all_configs.iter() {
         if c.channels() >= 2 && c.sample_format() == SAMPLE_FORMAT {
-            log::debug!("Found audio source config: {:?}", &c);
+            log::debug!("Found audio {} config: {:?}", direction, &c);
             configs.push(*c);
         }
     }
@@ -203,7 +204,7 @@ impl AudioSink {
                 }
             },
             move |err| log::error!("Error during audio output {:?}", err),
-            None, // None=blocking, Some(Duration)=timeout
+            None,
         )?;
         stream.play()?;
         log::info!("Starting playback stream on device {}", self.device.name()?);
@@ -224,7 +225,7 @@ impl AudioSink {
 impl AudioSource {
     fn new(sample_rate: u32, device_str: Option<String>) -> Result<Self> {
         let host = cpal::default_host();
-        let mut device = host.default_input_device().expect("no output device available");
+        let mut device = host.default_input_device().expect("no input device available");
         if let Some(device_str) = device_str {
             for avail_dev in host.input_devices()? {
                 if avail_dev.name()?.to_lowercase().contains(&device_str.to_lowercase()) {
@@ -269,10 +270,10 @@ impl AudioSource {
                 rb.sync();
                 debug_assert_eq!(n, len);
             },
-            move |err| log::error!("Error during audio output {:?}", err),
-            None, // None=blocking, Some(Duration)=timeout
+            move |err| log::error!("Error during audio input {:?}", err),
+            None,
         )?;
-        log::info!("Starting caputre stream on device {}", self.device.name()?);
+        log::info!("Starting capture stream on device {}", self.device.name()?);
         stream.play()?;
         self.stream = Some(stream);
         Ok(())
@@ -288,7 +289,7 @@ impl AudioSource {
     }
 }
 
-pub(crate) struct AtomicControls {
+pub struct AtomicControls {
     has_init: Arc<AtomicBool>,
     should_stop: Arc<AtomicBool>,
 }
@@ -297,9 +298,10 @@ impl AtomicControls {
         (self.has_init, self.should_stop)
     }
 }
-pub(crate) struct GuiCom {
+pub struct GuiCom {
     pub s_lsnr: Option<SendLsnr>,
     pub s_spec: Option<(SendSpec, SendSpec)>,
+    pub s_audio: Option<SendAudio>,
     pub r_opt: Option<RecvControl>,
 }
 impl GuiCom {
@@ -308,9 +310,10 @@ impl GuiCom {
     ) -> (
         Option<SendLsnr>,
         Option<(SendSpec, SendSpec)>,
+        Option<SendAudio>,
         Option<RecvControl>,
     ) {
-        (self.s_lsnr, self.s_spec, self.r_opt)
+        (self.s_lsnr, self.s_spec, self.s_audio, self.r_opt)
     }
 }
 
@@ -323,20 +326,22 @@ fn get_worker_fn(
     df_com: Option<GuiCom>,
 ) -> impl FnMut() {
     let (has_init, should_stop) = controls.into_inner();
-    let (mut s_lsnr, mut s_spec, mut r_opt) = if let Some(df_com) = df_com {
+    let (mut s_lsnr, mut s_spec, mut s_audio, mut r_opt) = if let Some(df_com) = df_com {
         df_com.into_inner()
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
     move || {
         let mut df = unsafe { MODEL.clone().unwrap() };
-        debug_assert_eq!(df.ch, 1); // Processing for more channels are not implemented yet
+        debug_assert_eq!(df.ch, 1);
         let mut inframe = Array2::zeros((df.ch, df.hop_size));
         let mut outframe = inframe.clone();
         df.process(inframe.view(), outframe.view_mut())
             .expect("Failed to run DeepFilterNet");
         has_init.store(true, Ordering::Relaxed);
         log::info!("Worker init");
+
+        // Resamplers (if device SR != model SR)
         let (mut input_resampler, n_in) = if input_sr != df.sr {
             let r = FftFixedOut::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1)
                 .expect("Failed to init input resampler");
@@ -351,19 +356,19 @@ fn get_worker_fn(
                 .expect("Failed to init output resampler");
             let n_out = r.output_frames_max();
             let buf = r.output_buffer_allocate(true);
-            // let buf = vec![0.; n_out];
             (Some((r, buf)), n_out)
         } else {
             (None, df.hop_size)
         };
+
         while !should_stop.load(Ordering::Relaxed) {
             if rb_in.len() < n_in {
-                // Sleep for half a hop size
-                sleep(Duration::from_secs_f32(
-                    df.hop_size as f32 / df.sr as f32 / 2.,
-                ));
+                // half-hop sleep
+                sleep(Duration::from_secs_f32(df.hop_size as f32 / df.sr as f32 / 2.));
                 continue;
             }
+
+            // Input
             if let Some((ref mut r, ref mut buf)) = input_resampler.as_mut() {
                 let n = rb_in.pop_slice(&mut buf[0]);
                 debug_assert_eq!(n, n_in);
@@ -374,32 +379,47 @@ fn get_worker_fn(
                 let n = rb_in.pop_slice(inframe.as_slice_mut().unwrap());
                 debug_assert_eq!(n, n_in);
             }
+
+            // DF process
             let lsnr = df
                 .process(inframe.view(), outframe.view_mut())
                 .expect("Failed to run DeepFilterNet");
+
+            // Output to sink (ringbuf) + copy for GUI WAV writer
             let mut n = 0;
+            let mut audio_samples = Vec::with_capacity(n_out);
             if let Some((ref mut r, ref mut buf)) = output_resampler.as_mut() {
-                r.process_into_buffer(&[outframe.as_slice().unwrap()], buf, None).unwrap();
+                r.process_into_buffer(&[outframe.as_slice().unwrap()], buf, None)
+                    .unwrap();
                 while n < n_out {
                     n += rb_out.push_slice(&buf[0][n..]);
                 }
+                audio_samples.extend_from_slice(&buf[0]);
             } else {
                 let buf = outframe.as_slice().unwrap();
                 while n < n_out {
                     n += rb_out.push_slice(&buf[n..]);
                 }
+                audio_samples.extend_from_slice(buf);
             }
             debug_assert_eq!(n, n_out);
             rb_out.sync();
-            if let Some(ref mut s_lsnr) = s_lsnr.as_mut() {
-                s_lsnr.send(lsnr).expect("Failed to send to LSNR rb");
+
+            // ---- GUI 통신 (Main.rs가 WAV를 append) ----
+            if let Some(ref mut s_audio_ch) = s_audio.as_mut() {
+                if let Err(e) = s_audio_ch.send(audio_samples) {
+                    log::error!("Failed to send audio samples: {:?}", e);
+                }
+            }
+            if let Some(ref mut s_lsnr_ch) = s_lsnr.as_mut() {
+                let _ = s_lsnr_ch.send(lsnr);
             }
             if let Some((ref mut s_noisy, ref mut s_enh)) = s_spec.as_mut() {
                 push_spec(df.get_spec_noisy(), s_noisy);
                 push_spec(df.get_spec_enh(), s_enh);
             }
-            if let Some(ref mut r_opt) = r_opt.as_mut() {
-                while let Ok((c, v)) = r_opt.try_recv() {
+            if let Some(ref mut r_ctrl) = r_opt.as_mut() {
+                while let Ok((c, v)) = r_ctrl.try_recv() {
                     match c {
                         DfControl::AttenLim => df.set_atten_lim(v),
                         DfControl::PostFilterBeta => df.set_pf_beta(v),
@@ -414,16 +434,19 @@ fn get_worker_fn(
 }
 
 fn push_spec(spec: ArrayView2<Complex32>, sender: &SendSpec) {
-    debug_assert_eq!(spec.len_of(Axis(0)), 1); // only single channel for now
-    let out = spec.iter().map(|x| x.norm_sqr().max(1e-10).log10() * 10.).collect::<Vec<f32>>();
-    sender.send(out.into_boxed_slice()).expect("Failed to send spectrogram")
+    debug_assert_eq!(spec.len_of(Axis(0)), 1);
+    let out = spec
+        .iter()
+        .map(|x| x.norm_sqr().max(1e-10).log10() * 10.)
+        .collect::<Vec<f32>>();
+    let _ = sender.send(out.into_boxed_slice());
 }
 
 pub fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io::Result<()> {
+    use std::io::Write;
     let ts = buf.timestamp_millis();
     let module = record.module_path().unwrap_or("").to_string();
     let level_style = buf.default_level_style(log::Level::Info);
-
     writeln!(
         buf,
         "{} | {} | {} {}",
@@ -446,20 +469,24 @@ pub struct DeepFilterCapture {
 
 impl Default for DeepFilterCapture {
     fn default() -> Self {
-        DeepFilterCapture::new(None, None, None, None, None)
+        DeepFilterCapture::new(None, None, None, None, None, None)
             .expect("Error during DeepFilterCapture initialization")
     }
 }
+
 impl DeepFilterCapture {
     pub fn new(
         model_path: Option<PathBuf>,
         s_lsnr: Option<SendLsnr>,
         s_noisy: Option<SendSpec>,
         s_enh: Option<SendSpec>,
+        s_audio: Option<SendAudio>,
         r_opt: Option<RecvControl>,
     ) -> Result<Self> {
         let ch = 1;
         let (sr, frame_size, freq_size) = init_df(model_path, ch);
+
+        // Ring buffers
         let in_rb = HeapRb::<f32>::new(frame_size * 100);
         let out_rb = HeapRb::<f32>::new(frame_size * 100);
         let (in_prod, in_cons) = in_rb.split();
@@ -467,8 +494,11 @@ impl DeepFilterCapture {
         let in_prod = in_prod.into_postponed();
         let out_prod = out_prod.into_postponed();
 
+        // Devices
         let mut source = AudioSource::new(sr as u32, None)?;
         let mut sink = AudioSink::new(sr as u32, None)?;
+
+        // Worker
         let should_stop = Arc::new(AtomicBool::new(false));
         let has_init = Arc::new(AtomicBool::new(false));
         let s_spec = match (s_noisy, s_enh) {
@@ -482,6 +512,7 @@ impl DeepFilterCapture {
         let df_com = GuiCom {
             s_lsnr,
             s_spec,
+            s_audio,
             r_opt,
         };
         let worker_handle = Some(thread::spawn(get_worker_fn(
@@ -492,10 +523,14 @@ impl DeepFilterCapture {
             controls,
             Some(df_com),
         )));
+
+        // 모델 warmup 완료 대기
         while !has_init.load(Ordering::Relaxed) {
-            sleep(Duration::from_secs_f32(0.01));
+            sleep(Duration::from_millis(10));
         }
         log::info!("DeepFilter Capture init");
+
+        // Start I/O streams
         source.start(in_prod)?;
         sink.start(out_cons)?;
 
@@ -515,7 +550,7 @@ impl DeepFilterCapture {
         self.source.pause()?;
         if let Some(h) = self.worker_handle.take() {
             log::info!("Joining DF Worker");
-            self.should_stop.swap(true, Ordering::Relaxed);
+            self.should_stop.store(true, Ordering::Relaxed);
             h.join().expect("Error during DF worker join");
         }
         Ok(())
@@ -523,8 +558,6 @@ impl DeepFilterCapture {
 }
 
 #[allow(unused)]
-#[allow(unknown_lints)] // assigning_clones is clippy nightly only
-#[allow(clippy::assigning_clones)]
 pub fn main() -> Result<()> {
     INIT_LOGGER.call_once(|| {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -537,7 +570,7 @@ pub fn main() -> Result<()> {
     });
 
     let (lsnr_prod, mut lsnr_cons) = unbounded();
-    let mut model_path = env::var("DF_MODEL").ok().map(PathBuf::from);
+    let mut model_path = Some(PathBuf::from("models/DeepFilterNet3_ll_onnx.tar.gz"));
     unsafe {
         if model_path.is_none() && MODEL_PATH.is_some() {
             model_path = MODEL_PATH.clone()
@@ -546,13 +579,13 @@ pub fn main() -> Result<()> {
     if let Some(p) = model_path.as_ref() {
         log::info!("Running with model '{:?}'", p);
     }
-    let _c = DeepFilterCapture::new(model_path, Some(lsnr_prod), None, None, None);
+    let _c = DeepFilterCapture::new(model_path, Some(lsnr_prod), None, None, None, None)?;
 
     loop {
         sleep(Duration::from_millis(200));
         while let Ok(lsnr) = lsnr_cons.try_recv() {
             print!("\rCurrent SNR: {:>5.1} dB{esc}[1;", lsnr, esc = 27 as char);
+            let _ = std::io::stdout().flush();
         }
-        stdout().flush().unwrap();
     }
 }
