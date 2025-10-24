@@ -93,6 +93,8 @@ pub fn main() -> iced::Result {
 
 static mut SPEC_NOISY: Option<Arc<Mutex<SpecImage>>> = None;
 static mut SPEC_ENH: Option<Arc<Mutex<SpecImage>>> = None;
+static mut WAVE_NOISY: Option<Arc<Mutex<WaveImage>>> = None;
+static mut WAVE_ENH: Option<Arc<Mutex<WaveImage>>> = None;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RecordingState {
@@ -138,6 +140,8 @@ struct SpecView {
     max_dfthreshdb: f32,
     noisy_img: image::Handle,
     enh_img: image::Handle,
+    noisy_wave_img: image::Handle,
+    enh_wave_img: image::Handle,
     r_lsnr: Option<RecvLsnr>,
     r_noisy: Option<RecvSpec>,
     r_enh: Option<RecvSpec>,
@@ -163,6 +167,8 @@ pub enum Message {
     LsnrChanged(f32),
     NoisyChanged,
     EnhChanged,
+    NoisyWaveChanged,
+    EnhWaveChanged,
     AttenLimChanged(f32),
     PostFilterChanged(f32),
     MinThreshDbChanged(f32),
@@ -171,6 +177,93 @@ pub enum Message {
     StartRecording,
     PauseRecording,
     Exit,
+}
+
+
+struct WaveImage {
+    im: RgbaImage,
+    width: u32,
+    height: u32,
+    samples: Vec<f32>,
+}
+
+impl WaveImage {
+    fn new(width: u32, height: u32) -> Self {
+        Self {
+            im: RgbaImage::from_pixel(width, height, Rgba([20, 20, 30, 255])),
+            width,
+            height,
+            samples: Vec::new(),
+        }
+    }
+    
+    fn update(&mut self, new_samples: &[f32]) {
+        if new_samples.is_empty() {
+            return;
+        }
+        
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let mid_y = h / 2;
+        
+        // 새 샘플들을 픽셀 컬럼으로 변환하여 왼쪽에 그리기
+        let samples_per_pixel = new_samples.len().max(1);
+        let pixels_to_add = (new_samples.len() as f32 / samples_per_pixel as f32).ceil() as usize;
+        
+        // 이미지를 오른쪽으로 shift (기존 파형을 오른쪽으로 밀어냄)
+        if pixels_to_add > 0 {
+            let shift_amount = pixels_to_add.min(w);
+            
+            // 오른쪽으로 shift
+            for y in 0..h {
+                for x in (shift_amount..w).rev() {
+                    let pixel = self.im.get_pixel((x - shift_amount) as u32, y as u32).clone();
+                    self.im.put_pixel(x as u32, y as u32, pixel);
+                }
+            }
+            
+            // 왼쪽 새 영역을 배경색으로 초기화
+            for y in 0..h {
+                for x in 0..shift_amount {
+                    self.im.put_pixel(x as u32, y as u32, Rgba([20, 20, 30, 255]));
+                }
+            }
+            
+            // 새 샘플들을 왼쪽에 그리기
+            let samples_per_column = (new_samples.len() as f32 / shift_amount as f32).ceil() as usize;
+            
+            for col in 0..shift_amount {
+                let start_idx = col * samples_per_column;
+                let end_idx = ((col + 1) * samples_per_column).min(new_samples.len());
+                
+                if start_idx >= new_samples.len() {
+                    break;
+                }
+                
+                // 이 컬럼의 최대/최소값 찾기
+                let mut max_val = -1.0f32;
+                let mut min_val = 1.0f32;
+                
+                for i in start_idx..end_idx {
+                    max_val = max_val.max(new_samples[i]);
+                    min_val = min_val.min(new_samples[i]);
+                }
+                
+                // Y 좌표로 변환
+                let y_max = ((mid_y as f32 - max_val * mid_y as f32) as i32).max(0).min(h as i32 - 1);
+                let y_min = ((mid_y as f32 - min_val * mid_y as f32) as i32).max(0).min(h as i32 - 1);
+                
+                // 세로 선 그리기
+                for y in y_min.min(y_max)..=y_max.max(y_min) {
+                    self.im.put_pixel(col as u32, y as u32, Rgba([100, 200, 255, 255]));
+                }
+            }
+        }
+    }
+    
+    fn image_handle(&self) -> image::Handle {
+        image::Handle::from_pixels(self.width, self.height, self.im.as_raw().to_vec())
+    }
 }
 
 struct SpecImage {
@@ -223,14 +316,19 @@ impl Application for SpecView {
     type Flags = ();
 
     fn new(_flags: ()) -> (Self, Command<Message>) {
-        let w = 1000;
+        let spec_w = 600;
+        let wave_w = 400;
         let h = 250;
-        let (noisy_img, enh_img) = unsafe {
-            SPEC_NOISY = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
-            SPEC_ENH = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
+        let (noisy_img, enh_img, noisy_wave_img, enh_wave_img) = unsafe {
+            SPEC_NOISY = Some(Arc::new(Mutex::new(SpecImage::new(spec_w, h, -100., -10.))));
+            SPEC_ENH = Some(Arc::new(Mutex::new(SpecImage::new(spec_w, h, -100., -10.))));
+            WAVE_NOISY = Some(Arc::new(Mutex::new(WaveImage::new(wave_w, h))));
+            WAVE_ENH = Some(Arc::new(Mutex::new(WaveImage::new(wave_w, h))));
             (
                 SPEC_NOISY.as_ref().unwrap().lock().unwrap().image_handle(),
                 SPEC_ENH.as_ref().unwrap().lock().unwrap().image_handle(),
+                WAVE_NOISY.as_ref().unwrap().lock().unwrap().image_handle(),
+                WAVE_ENH.as_ref().unwrap().lock().unwrap().image_handle(),
             )
         };
 
@@ -250,6 +348,8 @@ impl Application for SpecView {
                 s_controls: None,
                 noisy_img,
                 enh_img,
+                noisy_wave_img,
+                enh_wave_img,
                 recording_state: RecordingState::Stopped,
                 writer_thread_handle: None,
                 writer_thread_sender: None,
@@ -426,6 +526,15 @@ impl Application for SpecView {
                 if let Some(task) = self.update_noisy() { commands.push(Command::perform(task, move |m| m)) }
                 if let Some(task) = self.update_enh()   { commands.push(Command::perform(task, move |m| m)) }
                 if let Some(task) = self.update_audio() { commands.push(Command::perform(task, move |m| m)) }
+                
+                // Wave 이미지 업데이트
+                self.noisy_wave_img = unsafe {
+                    WAVE_NOISY.as_ref().unwrap().lock().unwrap().image_handle()
+                };
+                self.enh_wave_img = unsafe {
+                    WAVE_ENH.as_ref().unwrap().lock().unwrap().image_handle()
+                };
+                
                 return Command::batch(commands);
             }
 
@@ -453,6 +562,27 @@ impl Application for SpecView {
                 };
             }
 
+            Message::NoisyWaveChanged => {
+                self.noisy_wave_img = unsafe {
+                    WAVE_NOISY
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .expect("Failed to lock WAVE_NOISY")
+                        .image_handle()
+                };
+            }
+
+            Message::EnhWaveChanged => {
+                self.enh_wave_img = unsafe {
+                    WAVE_ENH
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .expect("Failed to lock WAVE_ENH")
+                        .image_handle()
+                };
+            }
 
             Message::AttenLimChanged(v) => {
                 self.atten_lim = v;
@@ -639,8 +769,10 @@ impl SpecView {
             let sender = self.writer_thread_sender.clone();
             
             Some(async move {
-                // ==== FIXED: 모든 패킷을 Writer 스레드로 직접 전송 ====
                 let mut packet_count = 0;
+                let mut raw_samples = Vec::new();
+                let mut enh_samples = Vec::new();
+                
                 while let Ok(pkt) = recv.try_recv() {
                     if let Some(ref s) = sender {
                         let min_len = pkt.raw.len().min(pkt.enh.len());
@@ -648,7 +780,11 @@ impl SpecView {
                             let raw = pkt.raw[..min_len].to_vec();
                             let enh = pkt.enh[..min_len].to_vec();
                             
-                            // Writer 스레드로 전송 (논블로킹)
+                            // Wave 샘플 수집
+                            raw_samples.extend_from_slice(&raw);
+                            enh_samples.extend_from_slice(&enh);
+                            
+                            // Writer 스레드로 전송
                             let _ = s.try_send(WriterCommand::WriteRaw(raw));
                             let _ = s.try_send(WriterCommand::WriteEnh(enh));
                             
@@ -657,15 +793,27 @@ impl SpecView {
                     }
                 }
                 
-                Message::None // 처리만 하고 UI 업데이트 없음
+                // Wave 이미지 업데이트
+                if !raw_samples.is_empty() {
+                    unsafe {
+                        if let Some(wave) = WAVE_NOISY.as_mut() {
+                            wave.lock().unwrap().update(&raw_samples);
+                        }
+                        if let Some(wave) = WAVE_ENH.as_mut() {
+                            wave.lock().unwrap().update(&enh_samples);
+                        }
+                    }
+                }
+                
+                Message::None
             })
         } else { None }
     }
 
     fn specs(&self) -> Container<Message> {
         container(column![
-            spec_view("Noisy", self.noisy_img.clone(), 1000, 250),
-            spec_view("Enhanced", self.enh_img.clone(), 1000, 250),
+            combined_view("Noisy", self.noisy_wave_img.clone(), self.noisy_img.clone(), 400, 600, 250),
+            combined_view("Enhanced", self.enh_wave_img.clone(), self.enh_img.clone(), 400, 600, 250),
         ])
     }
 }
@@ -676,6 +824,36 @@ fn spec_view(title: &str, im: image::Handle, width: u16, height: u16) -> Element
         spec_raw(im, width, height)
     ]
     .max_width(width)
+    .width(Length::Fill)
+    .into()
+}
+
+fn combined_view(
+    title: &str,
+    wave_im: image::Handle,
+    spec_im: image::Handle,
+    wave_width: u16,
+    spec_width: u16,
+    height: u16,
+) -> Element<Message> {
+    column![
+        text(title).size(24).width(Length::Fill),
+        row![
+            column![
+                text("Waveform").size(16),
+                spec_raw(wave_im, wave_width, height)
+            ]
+            .width(wave_width),
+            column![
+                text("Spectrogram").size(16),
+                spec_raw(spec_im, spec_width, height)
+            ]
+            .width(spec_width),
+        ]
+        .spacing(10)
+    ]
+    .spacing(5)
+    .max_width(wave_width + spec_width + 10)
     .width(Length::Fill)
     .into()
 }
